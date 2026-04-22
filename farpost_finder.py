@@ -6,6 +6,7 @@ import socket
 import subprocess
 import threading
 import time
+import traceback
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
@@ -27,12 +28,13 @@ USER_AGENT = (
 SITE_ROOT = "https://www.farpost.ru"
 DEFAULT_REQUEST_TIMEOUT = 12.0
 DEFAULT_TOTAL_TIMEOUT = 45.0
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 GITHUB_OWNER = "ClockworkVL"
 GITHUB_REPO = "fpst"
 GITHUB_LATEST_RELEASE_API = (
     f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 )
+APP_LOG_PATH = Path(gettempdir()) / "farpost_finder.log"
 
 CITIES = {
     "Все города": "",
@@ -482,9 +484,10 @@ class FarpostApp:
                 total_timeout=DEFAULT_TOTAL_TIMEOUT,
                 progress_cb=self._set_status_threadsafe,
             )
-            self.root.after(0, lambda: self._render_offers(offers))
+            self.root.after(0, self._render_offers, offers)
         except Exception as exc:
-            self.root.after(0, lambda: self._handle_error(exc))
+            err_trace = traceback.format_exc()
+            self.root.after(0, self._handle_error, exc, err_trace)
 
     def start_update(self) -> None:
         if self._search_in_progress or self._update_in_progress:
@@ -499,10 +502,7 @@ class FarpostApp:
         try:
             release = self.updater.get_latest_installer()
             if not self.updater.has_newer_version(release.version_tag):
-                self.root.after(
-                    0,
-                    lambda: self._finish_update("У вас уже установлена актуальная версия."),
-                )
+                self.root.after(0, self._finish_update, "У вас уже установлена актуальная версия.")
                 return
             self._set_status_threadsafe(
                 f"Найдена версия {release.version_tag}. Готовлю скачивание..."
@@ -510,9 +510,10 @@ class FarpostApp:
             installer_path = self.updater.download_asset(
                 release, progress_cb=self._set_status_threadsafe
             )
-            self.root.after(0, lambda: self._offer_install_update(installer_path, release))
+            self.root.after(0, self._offer_install_update, installer_path, release)
         except Exception as exc:
-            self.root.after(0, lambda: self._handle_update_error(exc))
+            err_trace = traceback.format_exc()
+            self.root.after(0, self._handle_update_error, exc, err_trace)
 
     def _offer_install_update(self, installer_path: Path, release: ReleaseAsset) -> None:
         answer = messagebox.askyesno(
@@ -542,15 +543,16 @@ class FarpostApp:
         self._sync_action_buttons()
         self.status_var.set(message)
 
-    def _handle_update_error(self, exc: Exception) -> None:
+    def _handle_update_error(self, exc: Exception, err_trace: str | None = None) -> None:
         self._update_in_progress = False
         self._sync_action_buttons()
-        msg = str(exc).strip() or "Не удалось выполнить обновление."
+        msg = self._human_error_text(exc, "Не удалось выполнить обновление.")
+        self._append_log("UPDATE", exc, err_trace)
         self.status_var.set(msg)
         messagebox.showerror("Обновление", msg)
 
     def _set_status_threadsafe(self, message: str) -> None:
-        self.root.after(0, lambda m=message: self.status_var.set(m))
+        self.root.after(0, self.status_var.set, message)
 
     def _render_offers(self, offers: list[Offer]) -> None:
         self._search_in_progress = False
@@ -573,12 +575,39 @@ class FarpostApp:
         else:
             self.status_var.set("По вашему запросу объявления не найдены.")
 
-    def _handle_error(self, exc: Exception) -> None:
+    def _handle_error(self, exc: Exception, err_trace: str | None = None) -> None:
         self._search_in_progress = False
         self._sync_action_buttons()
-        error_text = str(exc).strip() or "Ошибка поиска. Проверьте интернет и попробуйте снова."
+        error_text = self._human_error_text(
+            exc, "Ошибка поиска. Проверьте интернет и попробуйте снова."
+        )
+        self._append_log("SEARCH", exc, err_trace)
         self.status_var.set(error_text)
         messagebox.showerror("Ошибка", error_text)
+
+    @staticmethod
+    def _human_error_text(exc: Exception | None, fallback: str) -> str:
+        if exc is None:
+            return fallback
+        text = str(exc).strip()
+        if text and text != "None":
+            return text
+        return f"{fallback} [{type(exc).__name__}]"
+
+    @staticmethod
+    def _append_log(scope: str, exc: Exception | None, err_trace: str | None) -> None:
+        try:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with APP_LOG_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n[{timestamp}] {scope}\n")
+                fh.write(f"Exception: {repr(exc)}\n")
+                if err_trace:
+                    fh.write(err_trace)
+                    if not err_trace.endswith("\n"):
+                        fh.write("\n")
+        except Exception:
+            # Logging must never crash GUI flow.
+            pass
 
     def _sync_action_buttons(self) -> None:
         self.search_btn.config(
