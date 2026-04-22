@@ -1,13 +1,17 @@
 import argparse
 import html
 import re
+import socket
 import threading
+import time
 import tkinter as tk
 import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.cookiejar import CookieJar
 from pathlib import Path
 from tkinter import messagebox, ttk
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
@@ -18,6 +22,8 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 SITE_ROOT = "https://www.farpost.ru"
+DEFAULT_REQUEST_TIMEOUT = 12.0
+DEFAULT_TOTAL_TIMEOUT = 45.0
 
 CITIES = {
     "Все города": "",
@@ -51,8 +57,19 @@ class FarpostClient:
     def __init__(self) -> None:
         self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
 
+    @staticmethod
+    def _remaining_timeout(deadline: float) -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("Search deadline exceeded.")
+        return min(DEFAULT_REQUEST_TIMEOUT, max(1.0, left))
+
     def _request(
-        self, url: str, method: str = "GET", data: bytes | None = None
+        self,
+        url: str,
+        method: str = "GET",
+        data: bytes | None = None,
+        timeout: float = DEFAULT_REQUEST_TIMEOUT,
     ) -> tuple[bytes, str, str]:
         req = Request(
             url,
@@ -60,11 +77,16 @@ class FarpostClient:
             headers={"User-Agent": USER_AGENT},
             method=method,
         )
-        with self.opener.open(req, timeout=25) as resp:
-            body = resp.read()
-            ctype = resp.headers.get("Content-Type", "")
-            final_url = resp.geturl()
-        return body, ctype, final_url
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                body = resp.read()
+                ctype = resp.headers.get("Content-Type", "")
+                final_url = resp.geturl()
+            return body, ctype, final_url
+        except HTTPError as exc:
+            raise RuntimeError(f"FarPost вернул HTTP {exc.code}.") from exc
+        except (URLError, socket.timeout, TimeoutError) as exc:
+            raise RuntimeError("FarPost долго не отвечает. Попробуйте ещё раз.") from exc
 
     @staticmethod
     def _decode(body: bytes, ctype: str) -> str:
@@ -84,15 +106,32 @@ class FarpostClient:
         unescaped = html.unescape(no_tags).replace("\xa0", " ")
         return SPACE_RE.sub(" ", unescaped).strip()
 
-    def ensure_verified(self, city_slug: str) -> None:
+    def ensure_verified(
+        self,
+        city_slug: str,
+        deadline: float,
+        progress_cb: Callable[[str], None] | None = None,
+    ) -> None:
         base = f"{SITE_ROOT}/{city_slug}/" if city_slug else f"{SITE_ROOT}/"
-        body, ctype, final_url = self._request(base)
+        if progress_cb:
+            progress_cb("Проверяю доступ к FarPost...")
+        body, ctype, final_url = self._request(
+            base, timeout=self._remaining_timeout(deadline)
+        )
         page = self._decode(body, ctype)
 
         if "altcha-widget" in page.lower() or "/verify?" in final_url:
             # FarPost marks this session as human after DELETE /verify in many cases.
-            self._request(f"{SITE_ROOT}/verify", method="DELETE")
-            body2, ctype2, _ = self._request(base)
+            if progress_cb:
+                progress_cb("Обхожу антибот-проверку FarPost...")
+            self._request(
+                f"{SITE_ROOT}/verify",
+                method="DELETE",
+                timeout=self._remaining_timeout(deadline),
+            )
+            body2, ctype2, _ = self._request(
+                base, timeout=self._remaining_timeout(deadline)
+            )
             page2 = self._decode(body2, ctype2)
             if "altcha-widget" in page2.lower():
                 raise RuntimeError(
@@ -100,38 +139,57 @@ class FarpostClient:
                     "Повторите попытку чуть позже или с другого IP."
                 )
 
-    def search(self, query: str, city_slug: str, max_pages: int = 3) -> list[Offer]:
+    def search(
+        self,
+        query: str,
+        city_slug: str,
+        max_pages: int = 3,
+        total_timeout: float = DEFAULT_TOTAL_TIMEOUT,
+        progress_cb: Callable[[str], None] | None = None,
+    ) -> list[Offer]:
         if not query.strip():
             return []
-        self.ensure_verified(city_slug)
+        deadline = time.monotonic() + max(10.0, total_timeout)
+        try:
+            self.ensure_verified(city_slug, deadline=deadline, progress_cb=progress_cb)
 
-        base = f"{SITE_ROOT}/{city_slug}/dir" if city_slug else f"{SITE_ROOT}/dir"
-        seen_urls: set[str] = set()
-        offers: list[Offer] = []
+            base = f"{SITE_ROOT}/{city_slug}/dir" if city_slug else f"{SITE_ROOT}/dir"
+            seen_urls: set[str] = set()
+            offers: list[Offer] = []
 
-        for page_num in range(1, max_pages + 1):
-            params = {"query": query}
-            if page_num > 1:
-                params["page"] = str(page_num)
-            url = f"{base}?{urlencode(params)}"
-            body, ctype, _ = self._request(url)
-            text = self._decode(body, ctype)
-            items = self._parse_results(text)
-            if not items:
-                break
+            for page_num in range(1, max_pages + 1):
+                if progress_cb:
+                    progress_cb(f"Сканирую страницу {page_num}/{max_pages}...")
+                params = {"query": query}
+                if page_num > 1:
+                    params["page"] = str(page_num)
+                url = f"{base}?{urlencode(params)}"
+                body, ctype, _ = self._request(
+                    url, timeout=self._remaining_timeout(deadline)
+                )
+                text = self._decode(body, ctype)
+                items = self._parse_results(text)
+                if not items:
+                    break
 
-            new_count = 0
-            for item in items:
-                if item.url in seen_urls:
-                    continue
-                seen_urls.add(item.url)
-                offers.append(item)
-                new_count += 1
-            if new_count == 0:
-                break
+                new_count = 0
+                for item in items:
+                    if item.url in seen_urls:
+                        continue
+                    seen_urls.add(item.url)
+                    offers.append(item)
+                    new_count += 1
+                if new_count == 0:
+                    break
 
-        offers.sort(key=lambda x: (x.price_value is None, x.price_value or 0))
-        return offers
+            if progress_cb:
+                progress_cb("Сортирую результаты...")
+            offers.sort(key=lambda x: (x.price_value is None, x.price_value or 0))
+            return offers
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "Превышено время ожидания ответа FarPost. Попробуйте повторить поиск."
+            ) from exc
 
     def _parse_results(self, text: str) -> list[Offer]:
         rows = re.findall(r"(<tr\s+data-ctr-trackable.*?</tr>)", text, flags=re.I | re.S)
@@ -278,7 +336,7 @@ class FarpostApp:
         max_pages = max(1, min(int(self.pages_var.get()), 20))
 
         self.search_btn.config(state="disabled")
-        self.status_var.set("Поиск по FarPost... это может занять 5-20 секунд.")
+        self.status_var.set("Запускаю поиск по FarPost...")
         self._clear_table()
 
         thread = threading.Thread(
@@ -288,10 +346,19 @@ class FarpostApp:
 
     def _search_worker(self, query: str, city_slug: str, max_pages: int) -> None:
         try:
-            offers = self.client.search(query=query, city_slug=city_slug, max_pages=max_pages)
+            offers = self.client.search(
+                query=query,
+                city_slug=city_slug,
+                max_pages=max_pages,
+                total_timeout=DEFAULT_TOTAL_TIMEOUT,
+                progress_cb=self._set_status_threadsafe,
+            )
             self.root.after(0, lambda: self._render_offers(offers))
         except Exception as exc:
             self.root.after(0, lambda: self._handle_error(exc))
+
+    def _set_status_threadsafe(self, message: str) -> None:
+        self.root.after(0, lambda m=message: self.status_var.set(m))
 
     def _render_offers(self, offers: list[Offer]) -> None:
         self.search_btn.config(state="normal")
@@ -315,8 +382,9 @@ class FarpostApp:
 
     def _handle_error(self, exc: Exception) -> None:
         self.search_btn.config(state="normal")
-        self.status_var.set("Ошибка поиска. Проверьте интернет и попробуйте снова.")
-        messagebox.showerror("Ошибка", str(exc))
+        error_text = str(exc).strip() or "Ошибка поиска. Проверьте интернет и попробуйте снова."
+        self.status_var.set(error_text)
+        messagebox.showerror("Ошибка", error_text)
 
     def _clear_table(self) -> None:
         for row_id in self.tree.get_children():
