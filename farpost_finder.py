@@ -28,7 +28,7 @@ USER_AGENT = (
 SITE_ROOT = "https://www.farpost.ru"
 DEFAULT_REQUEST_TIMEOUT = 12.0
 DEFAULT_TOTAL_TIMEOUT = 45.0
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 GITHUB_OWNER = "ClockworkVL"
 GITHUB_REPO = "fpst"
 GITHUB_LATEST_RELEASE_API = (
@@ -180,6 +180,9 @@ class GitHubUpdater:
 
 class FarpostClient:
     def __init__(self) -> None:
+        self._reset_session()
+
+    def _reset_session(self) -> None:
         self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
 
     @staticmethod
@@ -199,7 +202,12 @@ class FarpostClient:
         req = Request(
             url,
             data=data,
-            headers={"User-Agent": USER_AGENT},
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Referer": SITE_ROOT,
+            },
             method=method,
         )
         try:
@@ -274,47 +282,59 @@ class FarpostClient:
     ) -> list[Offer]:
         if not query.strip():
             return []
-        deadline = time.monotonic() + max(10.0, total_timeout)
-        try:
-            self.ensure_verified(city_slug, deadline=deadline, progress_cb=progress_cb)
 
-            base = f"{SITE_ROOT}/{city_slug}/dir" if city_slug else f"{SITE_ROOT}/dir"
-            seen_urls: set[str] = set()
-            offers: list[Offer] = []
+        attempts = 2
+        for attempt in range(1, attempts + 1):
+            deadline = time.monotonic() + max(10.0, total_timeout)
+            try:
+                self.ensure_verified(city_slug, deadline=deadline, progress_cb=progress_cb)
 
-            for page_num in range(1, max_pages + 1):
+                base = f"{SITE_ROOT}/{city_slug}/dir" if city_slug else f"{SITE_ROOT}/dir"
+                seen_urls: set[str] = set()
+                offers: list[Offer] = []
+
+                for page_num in range(1, max_pages + 1):
+                    if progress_cb:
+                        progress_cb(f"Сканирую страницу {page_num}/{max_pages}...")
+                    params = {"query": query}
+                    if page_num > 1:
+                        params["page"] = str(page_num)
+                    url = f"{base}?{urlencode(params)}"
+                    body, ctype, _ = self._request(
+                        url, timeout=self._remaining_timeout(deadline)
+                    )
+                    text = self._decode(body, ctype)
+                    items = self._parse_results(text)
+                    if not items:
+                        break
+
+                    new_count = 0
+                    for item in items:
+                        if item.url in seen_urls:
+                            continue
+                        seen_urls.add(item.url)
+                        offers.append(item)
+                        new_count += 1
+                    if new_count == 0:
+                        break
+
                 if progress_cb:
-                    progress_cb(f"Сканирую страницу {page_num}/{max_pages}...")
-                params = {"query": query}
-                if page_num > 1:
-                    params["page"] = str(page_num)
-                url = f"{base}?{urlencode(params)}"
-                body, ctype, _ = self._request(
-                    url, timeout=self._remaining_timeout(deadline)
-                )
-                text = self._decode(body, ctype)
-                items = self._parse_results(text)
-                if not items:
-                    break
+                    progress_cb("Сортирую результаты...")
+                offers.sort(key=lambda x: (x.price_value is None, x.price_value or 0))
+                return offers
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "Превышено время ожидания ответа FarPost. Попробуйте повторить поиск."
+                ) from exc
+            except RuntimeError as exc:
+                if "HTTP 412" in str(exc) and attempt < attempts:
+                    self._reset_session()
+                    time.sleep(0.7)
+                    continue
+                raise
 
-                new_count = 0
-                for item in items:
-                    if item.url in seen_urls:
-                        continue
-                    seen_urls.add(item.url)
-                    offers.append(item)
-                    new_count += 1
-                if new_count == 0:
-                    break
+        return []
 
-            if progress_cb:
-                progress_cb("Сортирую результаты...")
-            offers.sort(key=lambda x: (x.price_value is None, x.price_value or 0))
-            return offers
-        except TimeoutError as exc:
-            raise RuntimeError(
-                "Превышено время ожидания ответа FarPost. Попробуйте повторить поиск."
-            ) from exc
 
     def _parse_results(self, text: str) -> list[Offer]:
         rows = re.findall(r"(<tr\s+data-ctr-trackable.*?</tr>)", text, flags=re.I | re.S)
@@ -367,7 +387,7 @@ class FarpostClient:
 class FarpostApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("FarPost: поиск товаров и цен")
+        self.root.title(f"FarPost: поиск товаров и цен (v{APP_VERSION})")
         self.root.geometry("1260x700")
         self._icon_img: tk.PhotoImage | None = None
         self._set_window_icon()
@@ -425,6 +445,8 @@ class FarpostApp:
         self.search_btn.grid(row=0, column=6, sticky="w")
         self.update_btn = ttk.Button(controls, text="Обновить", command=self.start_update)
         self.update_btn.grid(row=0, column=7, sticky="w", padx=(8, 0))
+        self.version_label = ttk.Label(controls, text=f"v{APP_VERSION}")
+        self.version_label.grid(row=0, column=8, sticky="e", padx=(12, 0))
 
         controls.columnconfigure(1, weight=1)
 
