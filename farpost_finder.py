@@ -93,6 +93,10 @@ class GitHubUpdater:
                 raise RuntimeError(
                     "На GitHub пока нет опубликованного Release для автообновления."
                 ) from exc
+            if exc.code == 403:
+                raise RuntimeError(
+                    "GitHub временно ограничил запросы (HTTP 403). Попробуйте позже."
+                ) from exc
             raise RuntimeError(f"GitHub API вернул HTTP {exc.code}.") from exc
         except (URLError, socket.timeout, TimeoutError) as exc:
             raise RuntimeError("Не удалось подключиться к GitHub.") from exc
