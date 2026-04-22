@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+
+FarpostFinder.spec
+FarpostFinder_Installer.exe
