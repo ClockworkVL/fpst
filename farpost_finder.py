@@ -1,7 +1,9 @@
 import argparse
 import html
+import json
 import re
 import socket
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -10,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from http.cookiejar import CookieJar
 from pathlib import Path
+from tempfile import gettempdir
 from tkinter import messagebox, ttk
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -24,6 +27,12 @@ USER_AGENT = (
 SITE_ROOT = "https://www.farpost.ru"
 DEFAULT_REQUEST_TIMEOUT = 12.0
 DEFAULT_TOTAL_TIMEOUT = 45.0
+APP_VERSION = "1.1.0"
+GITHUB_OWNER = "ClockworkVL"
+GITHUB_REPO = "fpst"
+GITHUB_LATEST_RELEASE_API = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+)
 
 CITIES = {
     "Все города": "",
@@ -51,6 +60,116 @@ class Offer:
     seller: str
     date_text: str
     url: str
+
+
+@dataclass
+class ReleaseAsset:
+    version_tag: str
+    asset_name: str
+    download_url: str
+
+
+class GitHubUpdater:
+    def __init__(self) -> None:
+        self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
+
+    def _request_json(self, url: str, timeout: float = 20.0) -> dict:
+        req = Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/vnd.github+json",
+            },
+            method="GET",
+        )
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                payload = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(payload)
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise RuntimeError(
+                    "На GitHub пока нет опубликованного Release для автообновления."
+                ) from exc
+            raise RuntimeError(f"GitHub API вернул HTTP {exc.code}.") from exc
+        except (URLError, socket.timeout, TimeoutError) as exc:
+            raise RuntimeError("Не удалось подключиться к GitHub.") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Некорректный ответ от GitHub API.") from exc
+
+    @staticmethod
+    def _version_tuple(raw: str) -> tuple[int, ...] | None:
+        match = re.search(r"(\d+(?:\.\d+){0,3})", raw)
+        if not match:
+            return None
+        return tuple(int(x) for x in match.group(1).split("."))
+
+    def get_latest_installer(self) -> ReleaseAsset:
+        payload = self._request_json(GITHUB_LATEST_RELEASE_API)
+        tag_name = str(payload.get("tag_name", "")).strip()
+        assets = payload.get("assets", [])
+        if not isinstance(assets, list) or not assets:
+            raise RuntimeError(
+                "В последнем Release нет файлов. Нужен asset с установщиком .exe."
+            )
+
+        def score(asset: dict) -> tuple[int, int]:
+            name = str(asset.get("name", "")).lower()
+            exe = 1 if name.endswith(".exe") else 0
+            installer = 1 if "installer" in name or "setup" in name else 0
+            return installer, exe
+
+        candidates = sorted(assets, key=score, reverse=True)
+        for item in candidates:
+            name = str(item.get("name", ""))
+            url = str(item.get("browser_download_url", ""))
+            if name.lower().endswith(".exe") and url.startswith("https://"):
+                return ReleaseAsset(
+                    version_tag=tag_name or "unknown",
+                    asset_name=name,
+                    download_url=url,
+                )
+        raise RuntimeError(
+            "В Release не найден исполняемый установщик (.exe) для автообновления."
+        )
+
+    def has_newer_version(self, release_tag: str) -> bool:
+        current = self._version_tuple(APP_VERSION)
+        latest = self._version_tuple(release_tag)
+        if not current or not latest:
+            # If tags are non-standard, still allow user to update manually.
+            return True
+        return latest > current
+
+    def download_asset(
+        self, asset: ReleaseAsset, progress_cb: Callable[[str], None] | None = None
+    ) -> Path:
+        req = Request(
+            asset.download_url,
+            headers={"User-Agent": USER_AGENT},
+            method="GET",
+        )
+        target = Path(gettempdir()) / f"{asset.asset_name}"
+        try:
+            with self.opener.open(req, timeout=30) as resp:
+                total_size = int(resp.headers.get("Content-Length", "0") or "0")
+                downloaded = 0
+                with target.open("wb") as out:
+                    while True:
+                        chunk = resp.read(1024 * 64)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_cb:
+                            if total_size > 0:
+                                percent = int(downloaded * 100 / total_size)
+                                progress_cb(f"Скачивание обновления: {percent}%...")
+                            else:
+                                progress_cb("Скачивание обновления...")
+            return target
+        except (URLError, socket.timeout, TimeoutError) as exc:
+            raise RuntimeError("Не удалось скачать обновление с GitHub.") from exc
 
 
 class FarpostClient:
@@ -247,11 +366,16 @@ class FarpostApp:
         self._icon_img: tk.PhotoImage | None = None
         self._set_window_icon()
         self.client = FarpostClient()
+        self.updater = GitHubUpdater()
+        self._search_in_progress = False
+        self._update_in_progress = False
 
         self.query_var = tk.StringVar()
         self.city_var = tk.StringVar(value="Все города")
         self.pages_var = tk.IntVar(value=3)
-        self.status_var = tk.StringVar(value="Введите запрос и нажмите 'Искать'")
+        self.status_var = tk.StringVar(
+            value=f"Версия {APP_VERSION}. Введите запрос и нажмите 'Искать'"
+        )
 
         self._build_ui()
 
@@ -293,6 +417,8 @@ class FarpostApp:
 
         self.search_btn = ttk.Button(controls, text="Искать", command=self.start_search)
         self.search_btn.grid(row=0, column=6, sticky="w")
+        self.update_btn = ttk.Button(controls, text="Обновить", command=self.start_update)
+        self.update_btn.grid(row=0, column=7, sticky="w", padx=(8, 0))
 
         controls.columnconfigure(1, weight=1)
 
@@ -326,6 +452,8 @@ class FarpostApp:
         status.pack(fill="x")
 
     def start_search(self) -> None:
+        if self._update_in_progress:
+            return
         query = self.query_var.get().strip()
         if not query:
             messagebox.showwarning("Пустой запрос", "Введите название товара для поиска.")
@@ -335,7 +463,8 @@ class FarpostApp:
         city_slug = CITIES.get(city_label, "")
         max_pages = max(1, min(int(self.pages_var.get()), 20))
 
-        self.search_btn.config(state="disabled")
+        self._search_in_progress = True
+        self._sync_action_buttons()
         self.status_var.set("Запускаю поиск по FarPost...")
         self._clear_table()
 
@@ -357,11 +486,75 @@ class FarpostApp:
         except Exception as exc:
             self.root.after(0, lambda: self._handle_error(exc))
 
+    def start_update(self) -> None:
+        if self._search_in_progress or self._update_in_progress:
+            return
+        self._update_in_progress = True
+        self._sync_action_buttons()
+        self.status_var.set("Проверяю обновления на GitHub...")
+        thread = threading.Thread(target=self._update_worker, daemon=True)
+        thread.start()
+
+    def _update_worker(self) -> None:
+        try:
+            release = self.updater.get_latest_installer()
+            if not self.updater.has_newer_version(release.version_tag):
+                self.root.after(
+                    0,
+                    lambda: self._finish_update("У вас уже установлена актуальная версия."),
+                )
+                return
+            self._set_status_threadsafe(
+                f"Найдена версия {release.version_tag}. Готовлю скачивание..."
+            )
+            installer_path = self.updater.download_asset(
+                release, progress_cb=self._set_status_threadsafe
+            )
+            self.root.after(0, lambda: self._offer_install_update(installer_path, release))
+        except Exception as exc:
+            self.root.after(0, lambda: self._handle_update_error(exc))
+
+    def _offer_install_update(self, installer_path: Path, release: ReleaseAsset) -> None:
+        answer = messagebox.askyesno(
+            "Доступно обновление",
+            (
+                f"Найдена версия {release.version_tag}.\n"
+                f"Файл: {release.asset_name}\n\n"
+                "Скачать удалось. Запустить установщик сейчас?"
+            ),
+        )
+        if not answer:
+            self._finish_update("Обновление скачано. Установщик не запускался.")
+            return
+        try:
+            subprocess.Popen([str(installer_path)])
+            self.status_var.set(
+                "Установщик обновления запущен. После завершения установки откройте программу снова."
+            )
+            self._update_in_progress = False
+            self._sync_action_buttons()
+            self.root.after(800, self.root.destroy)
+        except Exception as exc:
+            self._handle_update_error(exc)
+
+    def _finish_update(self, message: str) -> None:
+        self._update_in_progress = False
+        self._sync_action_buttons()
+        self.status_var.set(message)
+
+    def _handle_update_error(self, exc: Exception) -> None:
+        self._update_in_progress = False
+        self._sync_action_buttons()
+        msg = str(exc).strip() or "Не удалось выполнить обновление."
+        self.status_var.set(msg)
+        messagebox.showerror("Обновление", msg)
+
     def _set_status_threadsafe(self, message: str) -> None:
         self.root.after(0, lambda m=message: self.status_var.set(m))
 
     def _render_offers(self, offers: list[Offer]) -> None:
-        self.search_btn.config(state="normal")
+        self._search_in_progress = False
+        self._sync_action_buttons()
         for offer in offers:
             self.tree.insert(
                 "",
@@ -381,10 +574,19 @@ class FarpostApp:
             self.status_var.set("По вашему запросу объявления не найдены.")
 
     def _handle_error(self, exc: Exception) -> None:
-        self.search_btn.config(state="normal")
+        self._search_in_progress = False
+        self._sync_action_buttons()
         error_text = str(exc).strip() or "Ошибка поиска. Проверьте интернет и попробуйте снова."
         self.status_var.set(error_text)
         messagebox.showerror("Ошибка", error_text)
+
+    def _sync_action_buttons(self) -> None:
+        self.search_btn.config(
+            state="disabled" if self._search_in_progress or self._update_in_progress else "normal"
+        )
+        self.update_btn.config(
+            state="disabled" if self._search_in_progress or self._update_in_progress else "normal"
+        )
 
     def _clear_table(self) -> None:
         for row_id in self.tree.get_children():
